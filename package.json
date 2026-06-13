@@ -1,8 +1,17 @@
 {
-  "name": "immediately-run-app",
+  "name": "immediately-run-file-selector",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "immediately.run": {
+    "requireLatest": "stale_ok",
+    "provides": [
+      {
+        "task": "pick-file",
+        "version": "1.0"
+      }
+    ]
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

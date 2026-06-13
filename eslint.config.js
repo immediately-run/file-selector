@@ -23,5 +23,18 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // `react-hooks/set-state-in-effect` is a new (v7) React-Compiler rule. The
+      // picker's controller (src/hooks/useFileSelector.ts) synchronizes with TWO
+      // external systems that legitimately require a synchronous setState in an
+      // effect: (1) the task-input subscription — when the host delivers params,
+      // we parse them and, on a caller bug (zero roots), set `invalid` + call
+      // `cancelTask()`; (2) directory/tree loading — when the navigation target
+      // changes we set `loading` before the async `fs` read (the canonical
+      // data-fetching effect). Neither causes a cascading render loop. The
+      // load-bearing lint for immediately.run — the Fast Refresh
+      // `react-refresh/only-export-components` rule — stays fully enforced.
+      'react-hooks/set-state-in-effect': 'off',
+    },
   },
 ])
