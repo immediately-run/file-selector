@@ -1,8 +1,12 @@
 // The pick-file controller (PICK_FILE_TASK_SPEC.md §3). Reads `useTaskInput()`,
-// navigates the delegated chroots via the `fs` module, and returns a result with
-// `completeTask()` / aborts with `cancelTask()`. It holds NO standing authority —
-// the chroots the host mounted ARE its world. Hooks live here (not in a component
-// file) to satisfy the Fast Refresh rule.
+// then hands the whole browse experience (entry list, breadcrumb, folder tree,
+// root list, navigation) to the shared `@immediately-run/file-explorer-ui`
+// `FileExplorerView`. This controller keeps only the PICKER CHROME: mode/params
+// parse, the Open/Cancel footer, save-name, ext filters, new-folder, overwrite
+// confirm, mobile framing, and the `completeTask()` / `cancelTask()` mapping to
+// the `{ root, relPath, created? }` result. It holds NO standing authority — the
+// delegated chroots ARE its world. Hooks live here (not in a component file) to
+// satisfy the Fast Refresh rule.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cancelTask,
@@ -11,9 +15,11 @@ import {
   useTaskInput,
   type FormFactor,
 } from '@immediately-run/sdk';
+import type { ExplorerRoot } from '@immediately-run/file-explorer-ui';
 import { listDir, makeDir } from '../fs';
+import { cleanRel, rootIndexOf, toExplorerRoots } from '../lib/explorerAdapter';
 import { isSafeRel, joinPath, matchesExt, segsOf } from '../lib/paths';
-import type { CalleeParams, Entry, PickFilter, PickFileResult, PickMode, RootInfo } from '../lib/types';
+import type { CalleeParams, PickFilter, PickFileResult, PickMode, RootInfo } from '../lib/types';
 
 const isMode = (v: unknown): v is PickMode =>
   v === 'open-file' || v === 'open-folder' || v === 'save-file';
@@ -61,7 +67,13 @@ function parseParams(raw: Record<string, unknown> | undefined): CalleeParams | n
   };
 }
 
-export type LoadState = 'loading' | 'ok' | 'error';
+/** The file the user has highlighted (via the library's `onSelect`), if any. */
+interface Selection {
+  rootIdx: number;
+  /** Clean mount-relative path (no leading slash). */
+  rel: string;
+  name: string;
+}
 
 export interface Controller {
   ready: boolean;
@@ -76,41 +88,31 @@ export interface Controller {
   cycleFilter: () => void;
   allowCreateFolder: boolean;
 
+  // ── what the library needs ──
   roots: RootInfo[];
-  rootIdx: number;
-  rootDisabled: (i: number) => boolean;
-  selectRoot: (i: number) => void;
+  explorerRoots: ExplorerRoot[];
+  cwd: string | null;
+  onNavigate: (root: ExplorerRoot, relPath: string) => void;
+  onSelect: (root: ExplorerRoot, relPath: string) => void;
+  onActivate: (root: ExplorerRoot, relPath: string, isDir: boolean) => void;
 
-  path: string[];
-  goTo: (segs: string[]) => void;
-
-  entries: Entry[];
-  loadState: LoadState;
-  reload: () => void;
-  matchesFilter: (e: Entry) => boolean;
-  sel: string | null;
-  pickEntry: (e: Entry) => void;
-  enterDir: (name: string) => void;
-
+  // ── new folder (picker chrome) ──
   newFolderName: string | null;
   setNewFolderName: (s: string) => void;
   startNewFolder: () => void;
   submitNewFolder: () => void;
   cancelNewFolder: () => void;
 
+  // ── save-name (picker chrome) ──
   saveName: string;
   setSaveName: (s: string) => void;
 
+  // ── overwrite confirm (picker chrome) ──
   overwrite: string | null;
   doOverwrite: () => void;
   cancelOverwrite: () => void;
 
-  // desktop tree
-  expanded: Record<string, boolean>;
-  treeChildren: Record<string, Entry[]>;
-  toggleExpand: (segs: string[]) => void;
-  treeKey: (segs: string[]) => string;
-
+  // ── footer ──
   canConfirm: boolean;
   primaryLabel: string;
   selectionLabel: string;
@@ -120,12 +122,9 @@ export interface Controller {
   busy: boolean;
   error: string | null;
 
-  // mobile drill-down
-  mobileView: 'roots' | 'dir';
-  openRootMobile: (i: number) => void;
+  // ── mobile framing ──
+  showBack: boolean;
   backMobile: () => void;
-
-  onListKeyDown: (e: React.KeyboardEvent) => void;
 }
 
 export function useFileSelector(): Controller {
@@ -134,24 +133,19 @@ export function useFileSelector(): Controller {
 
   const [params, setParams] = useState<CalleeParams | null>(null);
   const [invalid, setInvalid] = useState(false);
-  const [rootIdx, setRootIdx] = useState(0);
-  const [path, setPath] = useState<string[]>([]);
-  const [entries, setEntries] = useState<Entry[]>([]);
-  const [loadState, setLoadState] = useState<LoadState>('loading');
-  const [sel, setSel] = useState<string | null>(null);
+  // The current directory the library is browsing (absolute chroot path), or null
+  // for the synthetic roots-root (the library's root list). Controlled so we know
+  // the save destination / new-folder target / overwrite scope at all times.
+  const [cwd, setCwd] = useState<string | null>(null);
+  const [sel, setSel] = useState<Selection | null>(null);
   const [filterIdx, setFilterIdx] = useState(0);
   const [saveName, setSaveName] = useState('');
   const [newFolderName, setNewFolderName] = useState<string | null>(null);
   const [overwrite, setOverwrite] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [treeChildren, setTreeChildren] = useState<Record<string, Entry[]>>({});
-  const [mobileView, setMobileView] = useState<'roots' | 'dir'>('roots');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [reloadTick, setReloadTick] = useState(0);
 
   const createdPaths = useRef<Set<string>>(new Set());
-  const typeahead = useRef<{ buf: string; at: number }>({ buf: '', at: 0 });
 
   // ── init from task input (once) ──────────────────────────────────────────
   useEffect(() => {
@@ -166,9 +160,8 @@ export function useFileSelector(): Controller {
     setParams(parsed);
     setSaveName(parsed.defaultName ?? '');
     if (parsed.startIn) {
-      setRootIdx(parsed.startIn.root);
-      setPath(segsOf(parsed.startIn.relPath));
-      setMobileView('dir');
+      const base = parsed.roots[parsed.startIn.root];
+      setCwd(joinPath(base, ...segsOf(parsed.startIn.relPath)));
     }
   }, [input, params, invalid]);
 
@@ -181,164 +174,101 @@ export function useFileSelector(): Controller {
     }));
   }, [params]);
 
+  const explorerRoots = useMemo(() => toExplorerRoots(roots), [roots]);
+
   const mode: PickMode = params?.mode ?? 'open-file';
   const isSave = mode === 'save-file';
   const filters = params?.filters ?? [];
   const hasFilters = mode === 'open-file' && filters.length > 0;
   const activeFilter = hasFilters ? (filters[filterIdx] ?? filters[0]) : null;
-  const dest = roots[rootIdx];
-  const destWritable = !!dest && dest.mode === 'rw';
+
+  // The root that owns the current directory (null at the roots-root). Its index
+  // is the `root` field of the returned result; its writability gates create/save.
+  const curRootIdx = useMemo(() => {
+    if (!cwd) return null;
+    const i = roots.findIndex((r) => cwd === r.path || cwd.startsWith(r.path + '/'));
+    return i >= 0 ? i : null;
+  }, [cwd, roots]);
+  const curRoot = curRootIdx != null ? roots[curRootIdx] : null;
+  const destWritable = !!curRoot && curRoot.mode === 'rw';
+
   const allowCreateFolder =
-    (params?.allowCreateFolder ?? mode === 'save-file') && destWritable && loadState !== 'error';
-
-  const curDir = useMemo(
-    () => (dest ? joinPath(dest.path, ...path) : null),
-    [dest, path],
-  );
-
-  // ── load the current directory ───────────────────────────────────────────
-  useEffect(() => {
-    if (!curDir) return;
-    let live = true;
-    setLoadState('loading');
-    setError(null);
-    listDir(curDir)
-      .then((e) => {
-        if (!live) return;
-        setEntries(e);
-        setLoadState('ok');
-      })
-      .catch(() => {
-        if (!live) return;
-        setEntries([]);
-        setLoadState('error');
-      });
-    return () => {
-      live = false;
-    };
-  }, [curDir, reloadTick]);
+    (params?.allowCreateFolder ?? mode === 'save-file') && !!cwd && destWritable;
 
   const matchesFilter = useCallback(
-    (e: Entry): boolean => {
-      if (e.isDir) return true;
-      if (!activeFilter) return true;
-      return matchesExt(e.name, activeFilter.extensions);
-    },
+    (name: string): boolean => (activeFilter ? matchesExt(name, activeFilter.extensions) : true),
     [activeFilter],
   );
 
-  const sortedEntries = useMemo(
-    () =>
-      entries
-        .slice()
-        .sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1)),
-    [entries],
-  );
-
-  // Entries the user can actually act on (for keyboard navigation).
-  const selectable = useMemo(
-    () =>
-      sortedEntries.filter((e) => (mode === 'open-folder' ? e.isDir : e.isDir || matchesFilter(e))),
-    [sortedEntries, mode, matchesFilter],
-  );
-
-  const treeKey = useCallback((segs: string[]) => `${rootIdx}/${segs.join('/')}`, [rootIdx]);
-
-  const loadTreeChildren = useCallback(
-    async (segs: string[]) => {
-      if (!dest) return;
-      const key = treeKey(segs);
-      try {
-        const all = await listDir(joinPath(dest.path, ...segs));
-        setTreeChildren((m) => ({ ...m, [key]: all.filter((e) => e.isDir) }));
-      } catch {
-        setTreeChildren((m) => ({ ...m, [key]: [] }));
-      }
-    },
-    [dest, treeKey],
-  );
-
-  // Load the active root's top-level folders for the desktop tree.
-  useEffect(() => {
-    if (!dest || loadState === 'error') return;
-    if (formFactor.class === 'mobile') return;
-    void loadTreeChildren([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootIdx, dest, formFactor.class]);
-
-  const goTo = useCallback((segs: string[]) => {
-    setPath(segs.slice());
+  // ── library callbacks ────────────────────────────────────────────────────
+  // `onNavigate` fires from the library's flat list when the browsed directory
+  // changes (breadcrumb / opening a folder / opening a root). Adopt it as our
+  // controlled cwd — this is the save destination / open-folder choice / the
+  // new-folder target. `onActivate(dir)` reports the same transition, so keeping
+  // both in sync is idempotent.
+  const onNavigate = useCallback((root: ExplorerRoot, relPath: string) => {
+    const rel = cleanRel(relPath);
+    setCwd(rel ? joinPath(root.path, ...segsOf(rel)) : root.path);
     setSel(null);
     setNewFolderName(null);
   }, []);
 
-  const enterDir = useCallback((name: string) => {
-    setPath((p) => p.concat(name));
-    setSel(null);
-    setNewFolderName(null);
-  }, []);
-
-  const selectRoot = useCallback(
-    (i: number) => {
-      if (isSave && roots[i]?.mode === 'ro') return; // greyed destination
-      setRootIdx(i);
-      setPath([]);
-      setSel(null);
-      setNewFolderName(null);
-    },
-    [isSave, roots],
-  );
-
-  const rootDisabled = useCallback(
-    (i: number) => isSave && roots[i]?.mode === 'ro',
-    [isSave, roots],
-  );
-
-  const pickEntry = useCallback(
-    (e: Entry) => {
-      if (e.isDir) {
-        if (mode === 'open-folder') setSel((s) => (s === e.name ? null : e.name));
-        else enterDir(e.name);
+  // `onActivate` fires for both a directory (the library navigates into it and
+  // reports the NEW directory) and a file (a click/Enter). For directories we
+  // adopt the new cwd; for files we record the highlight (save-file also fills the
+  // name field). We never auto-complete here — the footer's primary button is the
+  // single commit path, so filter/writability gating stays meaningful.
+  const onActivate = useCallback(
+    (root: ExplorerRoot, relPath: string, isDir: boolean) => {
+      setError(null);
+      if (isDir) {
+        const rel = cleanRel(relPath);
+        setCwd(rel ? joinPath(root.path, ...segsOf(rel)) : root.path);
+        setSel(null);
+        setNewFolderName(null);
         return;
       }
-      if (mode === 'open-folder') return;
-      if (!matchesFilter(e)) return;
-      setSel(e.name);
-      if (isSave) setSaveName(e.name);
+      const rel = cleanRel(relPath);
+      const name = segsOf(rel).pop() ?? rel;
+      setSel({ rootIdx: rootIndexOf(root), rel, name });
+      if (isSave) setSaveName(name);
     },
-    [mode, matchesFilter, isSave, enterDir],
+    [isSave],
   );
 
-  const toggleExpand = useCallback(
-    (segs: string[]) => {
-      const key = treeKey(segs);
-      setExpanded((m) => {
-        const next = !m[key];
-        if (next && !treeChildren[key]) void loadTreeChildren(segs);
-        return { ...m, [key]: next };
-      });
+  // The library's single-cursor highlight. Same effect as a file activation's
+  // highlight; directories don't fire `onSelect`.
+  const onSelect = useCallback(
+    (root: ExplorerRoot, relPath: string) => {
+      setError(null);
+      const rel = cleanRel(relPath);
+      const name = segsOf(rel).pop() ?? rel;
+      setSel({ rootIdx: rootIndexOf(root), rel, name });
+      if (isSave) setSaveName(name);
     },
-    [treeKey, treeChildren, loadTreeChildren],
+    [isSave],
   );
 
-  const reload = useCallback(() => setReloadTick((t) => t + 1), []);
+  // ── filters ──────────────────────────────────────────────────────────────
+  const cycleFilter = useCallback(() => {
+    setFilterIdx((i) => (i + 1) % Math.max(1, filters.length));
+    setSel(null);
+  }, [filters.length]);
+
+  // ── result mapping ─────────────────────────────────────────────────────────
+  const finish = useCallback((rootIdx: number, rel: string, created: boolean) => {
+    if (!isSafeRel(rel)) {
+      setError('That name is not allowed.');
+      return;
+    }
+    const result: PickFileResult = { root: rootIdx, relPath: rel };
+    if (created) result.created = true;
+    completeTask(result);
+  }, []);
 
   const cancel = useCallback(() => cancelTask(), []);
 
-  const finish = useCallback(
-    (relSegs: string[], created: boolean) => {
-      const relPath = relSegs.join('/');
-      if (!isSafeRel(relPath)) {
-        setError('That name is not allowed.');
-        return;
-      }
-      const result: PickFileResult = { root: rootIdx, relPath };
-      if (created) result.created = true;
-      completeTask(result);
-    },
-    [rootIdx],
-  );
-
+  // ── new folder ─────────────────────────────────────────────────────────────
   const startNewFolder = useCallback(() => {
     if (!allowCreateFolder) return;
     setNewFolderName('');
@@ -347,7 +277,7 @@ export function useFileSelector(): Controller {
   const cancelNewFolder = useCallback(() => setNewFolderName(null), []);
 
   const submitNewFolder = useCallback(async () => {
-    if (newFolderName == null || !curDir) return;
+    if (newFolderName == null || !cwd || curRoot == null) return;
     const name = newFolderName.trim();
     if (!name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
       setError('Invalid folder name.');
@@ -355,159 +285,134 @@ export function useFileSelector(): Controller {
     }
     setBusy(true);
     setError(null);
-    const abs = joinPath(curDir, name);
+    const abs = joinPath(cwd, name);
     try {
       await makeDir(abs);
       createdPaths.current.add(abs);
-      const refreshed = await listDir(curDir);
-      setEntries(refreshed);
       setNewFolderName(null);
-      if (mode === 'open-folder') setSel(name); // the new folder IS the choice
-      else enterDir(name); // save-file: drop into the new folder
+      // Drop into the new folder (save-file) / make it the browsed dir; the
+      // library re-reads this directory on its next render.
+      setCwd(abs);
+      setSel(null);
     } catch (err) {
       // A forced create against a `ro` chroot lands here as EROFS — never data loss.
       setError(`Couldn't create folder: ${(err as Error)?.message ?? 'read-only'}.`);
     } finally {
       setBusy(false);
     }
-  }, [newFolderName, curDir, mode, enterDir]);
+  }, [newFolderName, cwd, curRoot]);
 
+  // ── confirm (the footer's primary button) ───────────────────────────────────
   const confirm = useCallback(() => {
-    if (!params || !dest || loadState === 'error') return;
+    if (!params) return;
     if (isSave) {
       const name = saveName.trim();
-      if (!name || !destWritable) return;
-      const exists = entries.some((e) => !e.isDir && e.name === name);
-      if (exists && overwrite !== name) {
-        setOverwrite(name);
-        return;
-      }
-      finish(path.concat(name), !exists);
+      if (!name || !cwd || curRootIdx == null || !destWritable) return;
+      const relSegs = curRoot ? segsOf(cwd.slice(curRoot.path.length)).concat(name) : [name];
+      const rel = relSegs.join('/');
+      // Overwrite confirm: check the current directory for a same-named file.
+      listDir(cwd)
+        .then((entries) => {
+          const exists = entries.some((e) => !e.isDir && e.name === name);
+          if (exists && overwrite !== name) {
+            setOverwrite(name);
+            return;
+          }
+          finish(curRootIdx, rel, !exists);
+        })
+        .catch(() => {
+          // Can't stat the dir — attempt the save; the host is the real boundary.
+          finish(curRootIdx, rel, false);
+        });
       return;
     }
     if (mode === 'open-folder') {
-      const rel = sel ? path.concat(sel) : path.slice();
+      // The chosen folder is the current directory (the library navigates into
+      // folders; you drill to the one you want, then Choose folder).
+      if (!cwd || curRootIdx == null || !curRoot) return;
+      const rel = segsOf(cwd.slice(curRoot.path.length)).join('/');
       if (rel.length === 0) return; // can't return the root itself (empty relPath)
-      const abs = joinPath(dest.path, ...rel);
-      finish(rel, createdPaths.current.has(abs));
+      const abs = joinPath(curRoot.path, ...segsOf(rel));
+      finish(curRootIdx, rel, createdPaths.current.has(abs));
       return;
     }
-    // open-file
+    // open-file — a highlighted, filter-matching file.
     if (!sel) return;
-    finish(path.concat(sel), false);
-  }, [params, dest, loadState, isSave, saveName, destWritable, entries, overwrite, finish, path, mode, sel]);
+    if (!matchesFilter(sel.name)) return;
+    finish(sel.rootIdx, sel.rel, false);
+  }, [params, isSave, saveName, cwd, curRootIdx, curRoot, destWritable, overwrite, finish, mode, sel, matchesFilter]);
 
   const doOverwrite = useCallback(() => {
-    if (overwrite == null) return;
+    if (overwrite == null || !cwd || curRootIdx == null || !curRoot) return;
     const name = overwrite;
     setOverwrite(null);
-    finish(path.concat(name), false);
-  }, [overwrite, finish, path]);
+    const rel = segsOf(cwd.slice(curRoot.path.length)).concat(name).join('/');
+    finish(curRootIdx, rel, false);
+  }, [overwrite, cwd, curRootIdx, curRoot, finish]);
 
   const cancelOverwrite = useCallback(() => setOverwrite(null), []);
 
-  const cycleFilter = useCallback(() => {
-    setFilterIdx((i) => (i + 1) % Math.max(1, filters.length));
-    setSel(null);
-  }, [filters.length]);
-
-  const openRootMobile = useCallback(
-    (i: number) => {
-      if (isSave && roots[i]?.mode === 'ro') return;
-      selectRoot(i);
-      setMobileView('dir');
-    },
-    [isSave, roots, selectRoot],
-  );
-
-  const backMobile = useCallback(() => {
-    if (path.length > 0) goTo(path.slice(0, -1));
-    else setMobileView('roots');
-  }, [path, goTo]);
-
-  // ── keyboard nav over the entry list ─────────────────────────────────────
-  const onListKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (!selectable.length) return;
-      const idx = sel ? selectable.findIndex((x) => x.name === sel) : -1;
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        const next = selectable[Math.min(selectable.length - 1, idx + 1)] ?? selectable[0];
-        if (next) setSel(next.name);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        const prev = selectable[Math.max(0, idx - 1)] ?? selectable[0];
-        if (prev) setSel(prev.name);
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const cur = selectable.find((x) => x.name === sel);
-        if (cur && cur.isDir && mode !== 'open-folder') enterDir(cur.name);
-        else confirm();
-        return;
-      }
-      if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        const now = Date.now();
-        const buf = now - typeahead.current.at < 700 ? typeahead.current.buf + e.key : e.key;
-        typeahead.current = { buf: buf.toLowerCase(), at: now };
-        const hit = selectable.find((x) => x.name.toLowerCase().startsWith(typeahead.current.buf));
-        if (hit) setSel(hit.name);
-      }
-    },
-    [selectable, sel, mode, enterDir, confirm],
-  );
-
+  // ── footer state ─────────────────────────────────────────────────────────
   const primaryLabel =
     mode === 'open-file' ? 'Open' : mode === 'open-folder' ? 'Choose folder' : 'Save';
 
   const canConfirm = useMemo(() => {
-    if (!dest || loadState === 'error') return false;
     if (isSave) return destWritable && saveName.trim().length > 0;
-    if (mode === 'open-folder') return sel != null || path.length > 0;
-    return sel != null;
-  }, [dest, loadState, isSave, destWritable, saveName, mode, sel, path]);
+    if (mode === 'open-folder') return curRootIdx != null && !!cwd && cwd !== curRoot?.path;
+    // open-file: a highlighted file that matches the active filter.
+    return !!sel && matchesFilter(sel.name);
+  }, [isSave, destWritable, saveName, mode, curRootIdx, cwd, curRoot, sel, matchesFilter]);
 
   const selectionLabel = useMemo(() => {
     if (error) return error;
-    if (!dest) return '';
-    const rel = isSave
-      ? path.concat(saveName).filter(Boolean).join('/')
-      : sel
-        ? path.concat(sel).join('/')
-        : mode === 'open-folder' && path.length
-          ? path.join('/')
-          : '';
-    if (!rel) return mode === 'open-file' ? 'Select a file.' : 'Choose a folder.';
-    return `${dest.label} / ${rel}`;
-  }, [error, dest, isSave, path, saveName, sel, mode]);
+    const label = curRoot?.label ?? (sel != null ? roots[sel.rootIdx]?.label : undefined);
+    if (isSave) {
+      const dirRel = curRoot && cwd ? segsOf(cwd.slice(curRoot.path.length)).join('/') : '';
+      const full = [dirRel, saveName].filter(Boolean).join('/');
+      if (!full || !label) return 'Choose a folder and file name.';
+      return `${label} / ${full}`;
+    }
+    if (mode === 'open-folder') {
+      const rel = curRoot && cwd ? segsOf(cwd.slice(curRoot.path.length)).join('/') : '';
+      if (!rel || !label) return 'Open a folder to choose it.';
+      return `${label} / ${rel}`;
+    }
+    if (!sel) return 'Select a file.';
+    return `${roots[sel.rootIdx]?.label ?? ''} / ${sel.rel}`;
+  }, [error, curRoot, cwd, isSave, saveName, mode, sel, roots]);
+
+  // ── "back to locations" ────────────────────────────────────────────────
+  // The library's list drills DOWN via its own breadcrumb, but under a CONTROLLED
+  // `cwd` its "roots-root" breadcrumb link can't report the null transition back to
+  // us (library gap — see report). We own that affordance instead: a header Back
+  // button that returns to the root list (`cwd = null`), so multi-root switching
+  // works on every form factor. Shown whenever we're inside a root.
+  const showBack = cwd != null;
+  const backMobile = useCallback(() => {
+    setCwd(null);
+    setSel(null);
+    setNewFolderName(null);
+  }, []);
 
   return {
     ready: !!params,
     invalid,
     formFactor,
     mode,
-    title: params?.title ?? (mode === 'save-file' ? 'Save file' : mode === 'open-folder' ? 'Choose folder' : 'Open file'),
+    title:
+      params?.title ??
+      (mode === 'save-file' ? 'Save file' : mode === 'open-folder' ? 'Choose folder' : 'Open file'),
     isSave,
     hasFilters,
     filterLabel: activeFilter?.label ?? 'All files',
     cycleFilter,
     allowCreateFolder,
     roots,
-    rootIdx,
-    rootDisabled,
-    selectRoot,
-    path,
-    goTo,
-    entries: sortedEntries,
-    loadState,
-    reload,
-    matchesFilter,
-    sel,
-    pickEntry,
-    enterDir,
+    explorerRoots,
+    cwd,
+    onNavigate,
+    onSelect,
+    onActivate,
     newFolderName,
     setNewFolderName,
     startNewFolder,
@@ -518,10 +423,6 @@ export function useFileSelector(): Controller {
     overwrite,
     doOverwrite,
     cancelOverwrite,
-    expanded,
-    treeChildren,
-    toggleExpand,
-    treeKey,
     canConfirm,
     primaryLabel,
     selectionLabel,
@@ -529,9 +430,7 @@ export function useFileSelector(): Controller {
     cancel,
     busy,
     error,
-    mobileView,
-    openRootMobile,
+    showBack,
     backMobile,
-    onListKeyDown,
   };
 }

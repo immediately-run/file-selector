@@ -1,20 +1,20 @@
+import { FileExplorerView } from '@immediately-run/file-explorer-ui';
+import '@immediately-run/file-explorer-ui/styles.css';
 import { useFileSelector } from '../hooks/useFileSelector';
 import { FileSelectorContext } from '../lib/context';
-import Breadcrumbs from './Breadcrumbs';
+import { explorerFs } from '../lib/explorerAdapter';
 import DialogFooter from './DialogFooter';
-import EntryList from './EntryList';
-import Icon, { type IconName } from './Icon';
+import Icon from './Icon';
+import NewFolderBar from './NewFolderBar';
 import OverwriteConfirm from './OverwriteConfirm';
-import PlacesPane from './PlacesPane';
 
-const rootIcon = (mode: 'ro' | 'rw'): IconName => (mode === 'ro' ? 'lock' : 'folder');
-
-// The toolbar above the entry list: breadcrumbs + new-folder + filter cycler.
-// Takes the controller directly (the FileSelector root owns it).
+// The toolbar above the browse area: the new-folder + filter chrome the library
+// doesn't provide. Breadcrumb + root list + entry rows are the library's.
 function Toolbar({ c }: { c: ReturnType<typeof useFileSelector> }) {
+  if (!c.allowCreateFolder && !c.hasFilters) return null;
   return (
     <div className="fs-toolbar">
-      <Breadcrumbs />
+      <span className="fs-toolbar-spacer" />
       {c.allowCreateFolder && (
         <button type="button" className="fs-btn fs-btn-quiet fs-toolbar-btn" onClick={c.startNewFolder}>
           <Icon name="folderPlus" size={14} strokeWidth={1.7} />
@@ -47,58 +47,31 @@ export default function FileSelector() {
     <FileSelectorContext.Provider value={c}>
       <div className={`fs${mobile ? ' fs-mobile' : ''}`}>
         <header className="fs-head">
-          {mobile && c.mobileView === 'dir' && (
-            <button type="button" className="fs-back" aria-label="Back" onClick={c.backMobile}>
+          {c.showBack && (
+            <button type="button" className="fs-back" aria-label="Locations" onClick={c.backMobile}>
               <Icon name="chevL" size={18} />
             </button>
           )}
           <h1 className="fs-title">{c.title}</h1>
         </header>
 
-        {mobile ? (
-          c.mobileView === 'roots' ? (
-            <div className="fs-mroots fs-scroll">
-              {c.roots.map((r, i) => {
-                const greyed = c.rootDisabled(i);
-                return (
-                  <button
-                    key={r.path}
-                    type="button"
-                    className={`fs-root${greyed ? ' is-greyed' : ''}`}
-                    disabled={greyed}
-                    onClick={() => c.openRootMobile(i)}
-                  >
-                    <Icon name={rootIcon(r.mode)} size={18} className="fs-root-ico" />
-                    <span className="fs-root-text">
-                      <span className="fs-root-label">{r.label}</span>
-                      <span className="fs-root-sub">{r.mode === 'ro' ? 'read-only' : 'can edit'}</span>
-                    </span>
-                    {r.mode === 'ro' ? (
-                      <Icon name="lock" size={14} strokeWidth={2} className="fs-root-badge" />
-                    ) : (
-                      <Icon name="chevR" size={16} className="fs-root-badge" />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="fs-pane">
-              <Toolbar c={c} />
-              <EntryList />
-              <DialogFooter />
-            </div>
-          )
-        ) : (
-          <div className="fs-body">
-            <PlacesPane />
-            <div className="fs-pane">
-              <Toolbar c={c} />
-              <EntryList />
-              <DialogFooter />
-            </div>
+        <div className="fs-pane">
+          <Toolbar c={c} />
+          <NewFolderBar />
+          <div className="fs-browse">
+            <FileExplorerView
+              roots={c.explorerRoots}
+              fs={explorerFs}
+              cwd={c.cwd}
+              selectionMode="single"
+              onSelect={c.onSelect}
+              onActivate={c.onActivate}
+              onNavigate={c.onNavigate}
+              layout="list"
+            />
           </div>
-        )}
+          <DialogFooter />
+        </div>
 
         <OverwriteConfirm />
       </div>
