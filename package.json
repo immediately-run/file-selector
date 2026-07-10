@@ -19,7 +19,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@immediately-run/file-explorer-ui": "file:../file-explorer",
+    "@immediately-run/file-explorer-ui": "github:immediately-run/file-explorer#f814bda16a7c5df3ef3102b0afb92ff89c1a0eb0",
     "@immediately-run/sdk": "^0.13.0",
     "lucide-react": "^0.469.0",
     "react": "^19.2.5",
